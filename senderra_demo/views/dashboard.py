@@ -1,0 +1,202 @@
+"""Tab 1 — is the pipeline working, how well, and what is it costing?
+
+Every number here is measured, not modelled. Content Understanding reports
+pages per meter and Azure OpenAI reports prompt, cached and completion tokens,
+so the cost figures are the pipeline's own arithmetic read back — not an
+estimate this app invented.
+"""
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from senderra_demo import aggregate, charts, format as fmt, schema
+
+
+def _tile(column, label: str, value: str, help_text: str) -> None:
+    with column:
+        st.metric(label, value, help=help_text)
+
+
+def render(frame: pd.DataFrame) -> None:
+    if frame.empty:
+        st.info("No documents found for the current filters. Upload a PDF on the "
+                "**Upload** tab, or widen the run filter in the sidebar.")
+        return
+
+    k = aggregate.kpis(frame)
+
+    st.subheader("Throughput")
+    cols = st.columns(4)
+    _tile(cols[0], "Documents", fmt.num(k.documents),
+          "Every document matching the current filters, at any stage.")
+    _tile(cols[1], "Extracted", f"{fmt.num(k.succeeded)}  ·  {fmt.pct(k.success_rate)}",
+          "Reached Succeeded. The percentage excludes documents still in flight, "
+          "so it does not drift while a batch is running.")
+    _tile(cols[2], "In flight", fmt.num(k.in_flight),
+          "Uploaded but not finished — queued for OCR, or OCR done and "
+          "extraction pending.")
+    _tile(cols[3], "Pages processed", fmt.num(k.pages),
+          "Pages Content Understanding billed. This is the unit the OCR meter "
+          "charges on.")
+
+    st.subheader("Quality")
+    cols = st.columns(4)
+    _tile(cols[0], "Field score", fmt.confidence(k.avg_field_score),
+          "The verdict per field: min(model confidence, grounding, OCR). A "
+          "minimum, not an average — an average lets a confident model wash out "
+          "a failed check. Empty for documents processed before scoring existed.")
+    _tile(cols[1], "Model confidence", fmt.confidence(k.avg_model_confidence),
+          "The model's own opinion of its work — one of the three inputs above, "
+          "and the only one that is not a measurement. Its calibration is "
+          "unmeasured, so it can lower a field score but never raise one.")
+    _tile(cols[2], "OCR confidence", fmt.confidence(k.avg_ocr_confidence),
+          "Measured OCR confidence of the words each value was quoted from. "
+          "Independent of the model: it measures the input.")
+    _tile(cols[3], "Classification proven", fmt.pct(k.classification_proven),
+          "Share of documents where at least one of the classifier's evidence "
+          "phrases was found verbatim in the text. Proves the evidence is real "
+          "— NOT that the type is right.")
+
+    cols = st.columns(4)
+    _tile(cols[0], "Needs review", fmt.num(k.needs_review),
+          "Documents that tripped at least one of the three gates. Recorded "
+          "only; nothing routes on it yet.")
+    _tile(cols[1], "Straight through", fmt.pct(k.straight_through),
+          "Settled documents that tripped no gate. This is the number the whole "
+          "business case turns on — roughly $17,000/year per point.")
+    _tile(cols[2], "Grounded fields", fmt.pct(k.avg_grounded),
+          "Share of populated fields traced back to a real location in the "
+          "document, giving a page and a bounding box.")
+    _tile(cols[3], "Quotes not found", fmt.num(k.quote_not_found),
+          "Quotes the model produced that are nowhere in the document. The "
+          "hallucination signal that needs no gold labels — but split-field "
+          "forms inflate it, so read the quotes before concluding anything.")
+
+    st.subheader("Cost")
+    cols = st.columns(4)
+    _tile(cols[0], "Total spend", fmt.usd(k.total_cost_usd, 2),
+          "Content Understanding plus model, summed over the filtered set. "
+          "Metered on both sides, not estimated.")
+    _tile(cols[1], "Cost per document", fmt.usd(k.avg_cost_usd, 4),
+          "Mean across extracted documents only. Failures are excluded — they "
+          "have a partial cost but no result to attribute it to.")
+    _tile(cols[2], "Cost per page", fmt.usd(k.cost_per_page, 4),
+          "Total spend ÷ total pages — not the average of per-document rates. "
+          "A 2-page document carries the same fixed prompt overhead as a "
+          "50-page one, so averaging the ratios would let short documents "
+          "dominate and report a rate nobody paid.")
+    _tile(cols[3], "Prompt cache saved", fmt.usd(k.cache_saving_usd, 4),
+          "What the same calls would have cost without the shared prompt "
+          "prefix — the measured value of the two-turn design.")
+
+    st.subheader("Tokens and speed")
+    cols = st.columns(4)
+    _tile(cols[0], "Tokens per document", fmt.num(k.avg_total_tokens),
+          f"Input plus output across both chat calls. "
+          f"Averages {fmt.num(k.avg_pages, 1)} pages per document.")
+    _tile(cols[1], "of which cached", f"{fmt.num(k.avg_cached_tokens)}  ·  "
+                                      f"{fmt.pct(k.avg_cache_hit)}",
+          "Cached input is a SUBSET of prompt tokens, not an addition, and "
+          "bills at 10% of list price. This is the number the whole prompt-cache "
+          "design exists to move.")
+    _tile(cols[2], "Output tokens", fmt.num(k.avg_completion_tokens),
+          "Per document, both calls. Output is the most expensive token there "
+          "is — roughly 8× input on this model.")
+    _tile(cols[3], "Time per document", fmt.ms(k.avg_pipeline_ms),
+          "Both function invocations end to end, including queue wait. Not "
+          "wall-clock through the whole system.")
+
+    st.divider()
+
+    st.caption("PIPELINE HEALTH")
+    st.plotly_chart(
+        charts.status_strip(aggregate.status_breakdown(frame), schema.STATUS_TONE),
+        width="stretch", config={"displayModeBar": False})
+
+    gates = aggregate.review_reasons(frame)
+    if not gates.empty:
+        st.caption("WHY DOCUMENTS WOULD GO TO REVIEW")
+        st.plotly_chart(
+            charts.review_gates(gates, {
+                schema.REVIEW_OCR: "OCR / legibility",
+                schema.REVIEW_CLASSIFICATION: "Classification unproven",
+                schema.REVIEW_EXTRACTION: "Field extraction",
+            }), width="stretch", config={"displayModeBar": False})
+        st.caption("Three independent gates, because they route to three "
+                   "different actions — rescan, confirm the type and "
+                   "re-extract, or check individual fields. One document can "
+                   "trip more than one.")
+
+    left, right = st.columns(2)
+    with left:
+        st.caption("DOCUMENTS BY CLASSIFIED TYPE")
+        st.plotly_chart(charts.by_type(aggregate.type_distribution(frame)),
+                        width="stretch", config={"displayModeBar": False})
+    with right:
+        st.caption("FIELD SCORE DISTRIBUTION")
+        st.plotly_chart(charts.score_bands(aggregate.score_bands(frame)),
+                        width="stretch", config={"displayModeBar": False})
+        st.caption("The spread a single average hides. The leftmost band is "
+                   "below the review floor.")
+
+    st.caption("WHERE THE TIME GOES, PER DOCUMENT")
+    st.plotly_chart(
+        charts.stacked_by_type(
+            aggregate.latency_by_type(frame),
+            ["Queue wait", "OCR (Content Understanding)", "Model (2 calls)"],
+            x_title="milliseconds, mean per document",
+            value_fmt="%{x:,.0f} ms", empty="No timings yet"),
+        width="stretch", config={"displayModeBar": False})
+    st.caption("Queue wait is shared-infrastructure noise; the other two are the "
+               "engine. Separated because they fail for different reasons and "
+               "scale on different limits — CU on pages/minute, the model on TPM.")
+
+    left, right = st.columns(2)
+    with left:
+        st.caption("WHERE THE MONEY GOES, PER DOCUMENT")
+        st.plotly_chart(
+            charts.stacked_by_type(
+                aggregate.cost_by_type(frame), ["Content Understanding", "Model"],
+                x_title="USD, mean per document", value_fmt="$%{x:.4f}",
+                empty="No cost recorded yet"),
+            width="stretch", config={"displayModeBar": False})
+        st.caption("Layout-on moves the first bar; prompt caching moves the "
+                   "second. The two decisions are independent.")
+    with right:
+        st.caption("TOKEN MIX, PER DOCUMENT")
+        st.plotly_chart(
+            charts.stacked_by_type(
+                aggregate.token_mix_by_type(frame),
+                ["Cached input", "Fresh input", "Output"],
+                x_title="tokens, mean per document", value_fmt="%{x:,.0f}",
+                empty="No token usage yet"),
+            width="stretch", config={"displayModeBar": False})
+        st.caption("Cached input bills at 10% of list. Fresh is prompt minus "
+                   "cached — they are not additive.")
+
+    # Both of these need enough data to say anything. A scatter of three points
+    # and a time series of one afternoon are noise presented as insight.
+    pairs = aggregate.confidence_pairs(frame)
+    intake = aggregate.intake_over_time(frame, "D")
+
+    left, right = st.columns(2)
+    with left:
+        st.caption("THE TWO CONFIDENCE SIGNALS")
+        if len(pairs) >= 5:
+            st.plotly_chart(charts.confidence_scatter(pairs), width="stretch",
+                            config={"displayModeBar": False})
+            st.caption("Points below the diagonal are confident answers over "
+                       "poor scans — the shape most likely to survive review "
+                       "while wrong.")
+        else:
+            st.info(f"Needs at least 5 extracted documents to be worth "
+                    f"plotting — there are {len(pairs)}.")
+    with right:
+        st.caption("INTAKE VOLUME BY DAY")
+        if len(intake) > 1:
+            st.plotly_chart(charts.intake(intake, "day"), width="stretch",
+                            config={"displayModeBar": False})
+        else:
+            st.info("Everything so far landed on one day, so there is no trend "
+                    "to draw yet.")

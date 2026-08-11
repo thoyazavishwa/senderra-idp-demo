@@ -1,0 +1,24 @@
+# The theme is PINNED to light on purpose.
+#
+# Every chart colour in senderra_demo/charts.py was validated against the light
+# chart surface (#fcfcfb) for colour-vision-deficiency separation and contrast.
+# Letting the OS flip the app to dark would put those same hexes on a dark
+# surface, where neither result holds. Supporting both means a second validated
+# palette and a runtime theme probe; for a single-audience demo that is cost
+# without benefit.
+
+[theme]
+base = "light"
+primaryColor = "#2a78d6"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f9f9f7"
+textColor = "#0b0b0b"
+font = "sans serif"
+
+[server]
+# 6 MB is a typical 50-page scan; 50 MB leaves room for the largest real files
+# without letting a mis-drop consume the container's memory.
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
