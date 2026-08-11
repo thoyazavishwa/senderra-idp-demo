@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from senderra_demo import format as fmt
+from senderra_demo import blobstore, format as fmt
 from senderra_demo.blobstore import BlobStore
 from senderra_demo.config import Settings
 
@@ -73,9 +73,25 @@ def render(blobs: BlobStore, settings: Settings) -> None:
              "pipeline would re-process it at full cost.",
     )
 
+    total_bytes = sum(f.size for f in uploaded) if uploaded else 0
+    limit_bytes = settings.upload_batch_mb * 1024 * 1024
+
     if uploaded:
-        st.caption(f"{len(uploaded)} file(s) ready · "
-                   f"{fmt.size(sum(f.size for f in uploaded))} total")
+        st.caption(f"{len(uploaded)} file(s) ready · {fmt.size(total_bytes)} total")
+
+    # ⚠️ A batch is charged against memory TWICE — Streamlit buffers each upload
+    # in the server process, and `getvalue()` below copies it again to hand bytes
+    # to the SDK. On a shared host that memory is not this session's to spend:
+    # the process also holds the parsed record cache and everyone else's session,
+    # and an OOM kill takes all of them down mid-demo. Per-file size is capped by
+    # `maxUploadSize` in `.streamlit/config.toml`; this caps the batch.
+    if total_bytes > limit_bytes:
+        st.error(
+            f"That batch is {fmt.size(total_bytes)}, over the "
+            f"{settings.upload_batch_mb} MB limit for one upload. Send it in "
+            f"smaller groups — the pipeline processes each document "
+            f"independently, so several batches give the same result as one.")
+        return
 
     if not st.button("Upload and process", type="primary", disabled=not uploaded):
         return
@@ -92,7 +108,8 @@ def render(blobs: BlobStore, settings: Settings) -> None:
                                  content_type, overwrite=True)
                     results.append((name, None))
                 except Exception as exc:                  # noqa: BLE001 — surfaced below
-                    results.append((name, f"{type(exc).__name__}: {exc}"))
+                    results.append(
+                        (name, blobstore.redact(f"{type(exc).__name__}: {exc}")))
         else:
             results = blobs.upload_many(settings.container_docs, items)
 

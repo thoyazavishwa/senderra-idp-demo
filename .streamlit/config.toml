@@ -17,8 +17,24 @@ font = "sans serif"
 
 [server]
 # 6 MB is a typical 50-page scan; 50 MB leaves room for the largest real files
-# without letting a mis-drop consume the container's memory.
+# without letting a mis-drop consume the container's memory. This is PER FILE —
+# a whole batch is capped separately by UPLOAD_BATCH_MB, because the per-file
+# limit says nothing about twenty files arriving together.
 maxUploadSize = 50
+
+[client]
+# Tracebacks are NOT shown in the browser.
+#
+# Two reasons, in order. An Azure exception quotes the request URL, and under a
+# SAS credential that URL is the credential — so a rendered traceback on a
+# public app URL is a credential disclosure. Second, this is a client-facing
+# demo: the honest failure messages the app raises itself are better than a
+# stack trace, and every Azure path already funnels through one
+# (`store.last_error`, rendered redacted in the sidebar).
+#
+# The full traceback still goes to the server log — Manage app → Logs on
+# Streamlit Cloud, stderr locally — so nothing is lost for debugging.
+showErrorDetails = "none"
 
 [browser]
 gatherUsageStats = false

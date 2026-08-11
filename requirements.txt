@@ -1,5 +1,11 @@
+# Upper bounds are deliberate. Streamlit Community Cloud resolves this file on
+# every rebuild, so an unpinned major release lands in production the day it
+# ships — and this app depends on API surface that majors have moved before:
+# `width="stretch"` (Streamlit 1.49+), `st.dataframe(on_select=…)`, pandas 2
+# datetime/`fillna` semantics in store.py, and `marker.cornerradius` (Plotly
+# 5.18+). Lower bounds say what is required; upper bounds say what is tested.
 streamlit>=1.49,<2
-azure-storage-blob>=12.19
-pandas>=2.1
-plotly>=5.20
-python-dotenv>=1.0
+azure-storage-blob>=12.19,<13
+pandas>=2.1,<3
+plotly>=5.20,<7
+python-dotenv>=1.0,<2

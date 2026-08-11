@@ -23,6 +23,24 @@ The cache is keyed on ETag rather than on a TTL alone because correctness and
 freshness then stop competing: `SYNC_TTL_SECONDS` only bounds how often we
 *ask*, never how stale an answer can be once we have asked.
 
+ONE STORE, SEVERAL VIEWERS
+-------------------------
+`st.cache_resource` hands this same object to every session, so with five people
+watching, five Streamlit script threads call `sync()` against it concurrently.
+Two rules keep that honest, and they are why there are two locks below:
+
+* **At most one refresh in flight.** Five simultaneous first loads would be five
+  identical listings and five identical download storms against one storage
+  account, which is how a demo earns a 503.
+* **A viewer never waits on someone else's refresh.** The thread that loses the
+  race serves the snapshot it already has and says so, rather than blocking. So
+  no network round trip is ever on another session's critical path — which is the
+  whole difference between "the dashboard is a second stale" and "the dashboard
+  froze for everyone while one person clicked Refresh".
+
+`_lock` therefore guards only in-memory state and is never held across I/O;
+`_refresh` is the try-lock that elects the one thread doing the work.
+
 WHAT IS DELIBERATELY NOT READ
 -----------------------------
 `work/**/words.json` is ~1 MB per document and this app never needs it — the
@@ -35,16 +53,24 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import pandas as pd
+from azure.core.exceptions import AzureError
 
 from senderra_demo import schema
-from senderra_demo.blobstore import BlobRef, BlobStore
+from senderra_demo.blobstore import BlobRef, BlobStore, redact
 from senderra_demo.config import Settings
 
 log = logging.getLogger(__name__)
+
+#: How many results files to keep parsed. Each is tens of kilobytes and they are
+#: only ever read one at a time on the detail screen, so this is a cap on a
+#: convenience — not a working set. Unbounded, it is a slow leak: a process that
+#: lives for days while people click through a few hundred documents would hold
+#: every one of them forever, on a host with ~1 GB for the whole app.
+_RESULTS_CACHE_MAX = 256
 
 
 @dataclass
@@ -57,6 +83,9 @@ class SyncStats:
     removed: int = 0
     duration_ms: int = 0
     at: float = field(default_factory=time.time)
+    #: True when this refresh was skipped because another session was already
+    #: doing it. The sidebar says so rather than implying a fresh listing.
+    deferred: bool = False
 
 
 def _safe_doc_id(doc_id: str) -> str:
@@ -83,7 +112,8 @@ class DocumentStore:
     def __init__(self, blobs: BlobStore, settings: Settings) -> None:
         self._blobs = blobs
         self._settings = settings
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()          # in-memory state; never held across I/O
+        self._refresh = threading.Lock()        # elects the one thread that syncs
 
         # blob name -> (etag, parsed record). The unit of caching.
         self._records: dict[str, tuple[str, dict]] = {}
@@ -94,6 +124,17 @@ class DocumentStore:
         self._frame: pd.DataFrame = pd.DataFrame()
         self._last_sync: float = 0.0
         self.stats = SyncStats()
+        #: The last Azure failure, already redacted, or None. Surfaced once in
+        #: the sidebar instead of as a traceback in whichever view happened to
+        #: touch the network — see `app.py`.
+        self.last_error: str | None = None
+
+    @property
+    def loaded(self) -> bool:
+        """Whether any sync has completed. Lets the caller word its spinner
+        honestly — the first load is seconds, every later one is milliseconds."""
+        with self._lock:
+            return bool(self._last_sync)
 
     @property
     def blobs(self) -> BlobStore:
@@ -102,44 +143,88 @@ class DocumentStore:
         return self._blobs
 
     # -- refresh ------------------------------------------------------------
+    def _fresh(self, force: bool) -> bool:
+        """Whether the snapshot is young enough to serve without asking Azure."""
+        if force:
+            return False
+        return bool(self._last_sync
+                    and time.time() - self._last_sync < self._settings.sync_ttl_seconds)
+
     def sync(self, force: bool = False) -> SyncStats:
-        """Bring the in-memory view up to date. Cheap unless something changed."""
+        """Bring the in-memory view up to date. Cheap unless something changed.
+
+        Never raises. An Azure failure lands in `last_error` and the previous
+        snapshot keeps serving, because a dashboard that says "showing data from
+        40 seconds ago, storage is not answering" is more useful than one that
+        replaces itself with a stack trace.
+        """
         with self._lock:
-            age = time.time() - self._last_sync
-            if not force and self._last_sync and age < self._settings.sync_ttl_seconds:
+            if self._fresh(force):
                 return self.stats
 
+        # Whoever gets here first does the work. Everyone else returns the
+        # snapshot they have — no session ever blocks on another's round trip.
+        if not self._refresh.acquire(blocking=False):
+            with self._lock:
+                return replace(self.stats, deferred=True)
+
+        try:
+            with self._lock:
+                # The winner may have finished between our TTL check and the
+                # try-lock, in which case there is nothing left to do.
+                if self._fresh(force):
+                    return self.stats
+                known = {name: etag for name, (etag, _) in self._records.items()}
+
             started = time.perf_counter()
+
+            # --- network, with no lock held ---------------------------------
             refs = self._blobs.list(self._settings.container_metrics,
                                     suffixes=schema.METRIC_SUFFIXES)
             live = {r.name: r.etag for r in refs}
-
-            stale = [name for name, etag in live.items()
-                     if self._records.get(name, (None,))[0] != etag]
-            removed = [name for name in self._records if name not in live]
-            for name in removed:
-                self._records.pop(name, None)
-
-            for name, record in self._blobs.get_json_many(
-                    self._settings.container_metrics, stale).items():
-                self._records[name] = (live[name], record)
+            stale = [name for name, etag in live.items() if known.get(name) != etag]
+            fetched = self._blobs.get_json_many(
+                self._settings.container_metrics, stale)
 
             # One extra list call, no downloads: PDFs that have no stage-1
             # record yet. Without this a freshly uploaded document is invisible
             # for the 30-60 s that OCR takes, which reads as a broken upload.
-            self._pdfs = {}
+            pdfs: dict[tuple[str, str], BlobRef] = {}
             for ref in self._blobs.list(self._settings.container_docs,
                                         suffixes=(".pdf", ".PDF")):
                 parsed = _split_docs_in_path(ref.name)
                 if parsed:
-                    self._pdfs[parsed] = ref
+                    pdfs[parsed] = ref
 
-            self._frame = self._build_frame()
-            self._last_sync = time.time()
-            self.stats = SyncStats(
-                listed=len(refs), downloaded=len(stale), removed=len(removed),
-                duration_ms=int((time.perf_counter() - started) * 1000))
-            return self.stats
+            # --- commit, under the lock, no I/O -----------------------------
+            with self._lock:
+                removed = [name for name in self._records if name not in live]
+                for name in removed:
+                    self._records.pop(name, None)
+                for name, record in fetched.items():
+                    self._records[name] = (live[name], record)
+
+                self._pdfs = pdfs
+                self._frame = self._build_frame()
+                self._last_sync = time.time()
+                self.last_error = None
+                self.stats = SyncStats(
+                    listed=len(refs), downloaded=len(fetched), removed=len(removed),
+                    duration_ms=int((time.perf_counter() - started) * 1000))
+                return self.stats
+
+        except AzureError as exc:
+            log.warning("sync failed: %s", redact(exc))
+            with self._lock:
+                self.last_error = redact(exc)
+                # Stamped even though nothing was fetched, so a broken
+                # credential is retried once per TTL rather than on every
+                # interaction of every session — five people clicking on a
+                # dead connection is a retry storm, not diagnostics.
+                self._last_sync = time.time()
+                return self.stats
+        finally:
+            self._refresh.release()
 
     # -- the table ----------------------------------------------------------
     def documents(self) -> pd.DataFrame:
@@ -255,18 +340,42 @@ class DocumentStore:
         else:
             return None
 
-        payload = self._blobs.get_json(self._settings.container_results, name)
+        payload = self._read(lambda: self._blobs.get_json(
+            self._settings.container_results, name))
         if payload is not None:
             with self._lock:
                 self._results[key] = payload
+                # Oldest insertion first — dicts preserve insertion order, and
+                # "the one opened longest ago" is as good an eviction rule as any
+                # for a screen that shows one document at a time.
+                while len(self._results) > _RESULTS_CACHE_MAX:
+                    self._results.pop(next(iter(self._results)))
         return payload
 
     def markdown(self, run_id: str, doc_id: str) -> str | None:
         """The OCR checkpoint both LLM calls actually read. Never cached — it is
         tens of kilobytes and opened rarely."""
-        return self._blobs.get_text(
+        return self._read(lambda: self._blobs.get_text(
             self._settings.container_work,
-            f"{run_id}/{_safe_doc_id(doc_id)}/markdown.md")
+            f"{run_id}/{_safe_doc_id(doc_id)}/markdown.md"))
+
+    def _read(self, fetch):
+        """Run a lazy per-document fetch, turning an Azure failure into `None`.
+
+        The detail screen's three network reads (results, evidence, markdown) all
+        go through here. They cannot be allowed to raise: an expired SAS or a
+        container the credential cannot see would otherwise render a traceback
+        inside whichever tab the viewer happened to open, five times over. The
+        error is recorded once, the view shows its own "not available yet"
+        message, and the sidebar carries the real reason.
+        """
+        try:
+            return fetch()
+        except AzureError as exc:
+            log.warning("lazy read failed: %s", redact(exc))
+            with self._lock:
+                self.last_error = redact(exc)
+            return None
 
 
 def _text(row: pd.Series, key: str) -> str | None:
