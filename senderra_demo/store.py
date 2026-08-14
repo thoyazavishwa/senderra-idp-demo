@@ -41,6 +41,19 @@ Two rules keep that honest, and they are why there are two locks below:
 `_lock` therefore guards only in-memory state and is never held across I/O;
 `_refresh` is the try-lock that elects the one thread doing the work.
 
+TWO SOURCES, ONE ROW SHAPE
+--------------------------
+With `COSMOS_ENABLED=true` the table's stage records come from a single Cosmos
+query instead of a listing plus N downloads — see `cosmosstore.py`. The ETag
+machinery above then does not apply, and does not need to: it is one round trip.
+
+The per-document reads (`result`, `markdown`, `raw_records`) stay on blobs in
+BOTH modes, and that is a correctness requirement rather than an optimisation.
+The Cosmos projection strips `classify_evidence` because it is document prose —
+PHI — and strips `calls`, `pages` and `cost_warnings` as bulk. Those four are
+exactly what the detail and raw-JSON screens exist to show, so "raw" has to mean
+the blob.
+
 WHAT IS DELIBERATELY NOT READ
 -----------------------------
 `work/**/words.json` is ~1 MB per document and this app never needs it — the
@@ -62,6 +75,7 @@ from azure.core.exceptions import AzureError
 from senderra_demo import schema
 from senderra_demo.blobstore import BlobRef, BlobStore, redact
 from senderra_demo.config import Settings
+from senderra_demo.cosmosstore import CosmosStore
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +126,10 @@ class DocumentStore:
     def __init__(self, blobs: BlobStore, settings: Settings) -> None:
         self._blobs = blobs
         self._settings = settings
+        #: Reads the table's stage records in one query when COSMOS_ENABLED is
+        #: set. The per-document lazy reads below stay on blobs regardless — see
+        #: cosmosstore.py for why that split is required, not merely convenient.
+        self._cosmos = CosmosStore(settings)
         self._lock = threading.RLock()          # in-memory state; never held across I/O
         self._refresh = threading.Lock()        # elects the one thread that syncs
 
@@ -179,12 +197,22 @@ class DocumentStore:
             started = time.perf_counter()
 
             # --- network, with no lock held ---------------------------------
-            refs = self._blobs.list(self._settings.container_metrics,
-                                    suffixes=schema.METRIC_SUFFIXES)
-            live = {r.name: r.etag for r in refs}
-            stale = [name for name, etag in live.items() if known.get(name) != etag]
-            fetched = self._blobs.get_json_many(
-                self._settings.container_metrics, stale)
+            if self._cosmos.enabled:
+                # One query for every stage record. No ETag diff: the items are
+                # small, it is a single round trip, and the bookkeeping to avoid
+                # re-reading them would cost more than the read. `live` is
+                # synthesised so the removal pass below is identical either way.
+                fetched = self._cosmos.stage_records()
+                live = {name: "cosmos" for name in fetched}
+                refs = list(fetched)
+            else:
+                refs = self._blobs.list(self._settings.container_metrics,
+                                        suffixes=schema.METRIC_SUFFIXES)
+                live = {r.name: r.etag for r in refs}
+                stale = [name for name, etag in live.items()
+                         if known.get(name) != etag]
+                fetched = self._blobs.get_json_many(
+                    self._settings.container_metrics, stale)
 
             # One extra list call, no downloads: PDFs that have no stage-1
             # record yet. Without this a freshly uploaded document is invisible
@@ -213,7 +241,13 @@ class DocumentStore:
                     duration_ms=int((time.perf_counter() - started) * 1000))
                 return self.stats
 
-        except AzureError as exc:
+        # `Exception`, not just `AzureError`. A Cosmos failure is an AzureError
+        # subclass and would have been caught — but a missing `azure-cosmos`
+        # package or a malformed COSMOS_ENDPOINT raises ImportError/ValueError,
+        # and those would escape as a browser traceback with the credential in
+        # it. This method's contract is already "never raises"; honouring it for
+        # every failure mode is what makes the Cosmos path safe to enable.
+        except Exception as exc:               # noqa: BLE001 — see above
             log.warning("sync failed: %s", redact(exc))
             with self._lock:
                 self.last_error = redact(exc)
@@ -293,14 +327,32 @@ class DocumentStore:
 
     # -- one document -------------------------------------------------------
     def raw_records(self, run_id: str, doc_id: str) -> dict[str, dict]:
-        """The two untouched stage records, for the raw-JSON view. Nested
-        objects that the flat table drops (`calls`, `pages`) live here."""
+        """The two untouched stage records, for the raw-JSON view.
+
+        ⚠️ Always read from BLOBS when Cosmos is the table's source, never from
+        the in-memory records. The Cosmos projection deliberately strips
+        `classify_evidence` (it is PHI), `calls`, `pages` and `cost_warnings` —
+        and those are exactly what this view exists to show. Reading the blob
+        costs two GETs on one document that somebody is already looking at, and
+        keeps "raw" an honest label.
+        """
         safe = _safe_doc_id(doc_id)
+        stages = (("ocr", schema.OCR_SUFFIX), ("extract", schema.EXTRACT_SUFFIX))
+
+        if self._cosmos.enabled:
+            out: dict[str, dict] = {}
+            for stage, suffix in stages:
+                record = self._read(lambda n=f"{run_id}/{safe}{suffix}":
+                                    self._blobs.get_json(
+                                        self._settings.container_metrics, n))
+                if record:
+                    out[stage] = record
+            return out
+
         with self._lock:
             return {
                 stage: record
-                for stage, suffix in (("ocr", schema.OCR_SUFFIX),
-                                      ("extract", schema.EXTRACT_SUFFIX))
+                for stage, suffix in stages
                 if (record := self._records.get(f"{run_id}/{safe}{suffix}", (None, None))[1])
             }
 

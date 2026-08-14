@@ -24,7 +24,16 @@ from dataclasses import dataclass
 from dotenv import dotenv_values
 
 _HERE = pathlib.Path(__file__).resolve().parent.parent          # senderra-idp-demo/
-_REPO = _HERE.parent                                            # senderra-idp-sol/
+
+#: The pipeline repo, so a machine that already has the pipeline configured needs
+#: no second copy of the connection string or the Cosmos key.
+#:
+#: ⚠️ This used to be `_HERE.parent`, which was right while the demo lived INSIDE
+#: senderra-idp-sol. The demo is now a sibling checkout, so `_HERE.parent` is the
+#: home directory and the fallback silently found nothing. Both candidates are
+#: tried, so neither layout breaks.
+_SIBLING_REPO = _HERE.parent / "senderra-idp-sol"
+_PARENT_REPO = _HERE.parent
 
 #: Streamlit Community Cloud checks the repo out under this path. Used only to
 #: decide whether an unset password is a warning or a hard stop — see
@@ -66,8 +75,10 @@ def _load_secrets() -> None:
 
 
 def _load_env() -> None:
-    """The demo folder's `.env`, then the repo root's. First non-empty wins."""
-    for candidate in (_HERE / ".env", _REPO / ".env"):
+    """The demo folder's `.env`, then the pipeline repo's. First non-empty wins."""
+    for candidate in (_HERE / ".env",
+                      _SIBLING_REPO / ".env",
+                      _PARENT_REPO / ".env"):
         if candidate.exists():
             _fill(dotenv_values(candidate).items())
 
@@ -89,6 +100,17 @@ def _i(key: str, default: int) -> int:
         return default
 
 
+def _b(key: str, default: bool = False) -> bool:
+    """Same truthiness rule as the Function App's `config.b()`.
+
+    Settings arrive as strings from every source — `.env`, `st.secrets`, real
+    environment variables — so `COSMOS_ENABLED=false` must not be truthy just for
+    being a non-empty string.
+    """
+    return str(os.environ.get(key, "true" if default else "false")
+               ).strip().lower() in ("true", "1", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     connection_string: str
@@ -101,6 +123,15 @@ class Settings:
     max_workers: int
     app_password: str
     upload_batch_mb: int
+
+    # --- Cosmos DB, the queryable projection (senderra-idp-sol guide/12) -----
+    # Off by default. Off = the table is built from metrics blobs exactly as
+    # before, so this app still works against a pipeline that has no Cosmos.
+    cosmos_enabled: bool
+    cosmos_endpoint: str
+    cosmos_key: str
+    cosmos_database: str
+    cosmos_container: str
 
     @property
     def account_name(self) -> str:
@@ -171,4 +202,10 @@ def load() -> Settings:
         # second copy — so a batch is charged twice against a container that has
         # ~1 GB total for the app, the pandas frame and everyone else's session.
         upload_batch_mb=_i("UPLOAD_BATCH_MB", 100),
+        # Same setting names the Function App uses, so one .env configures both.
+        cosmos_enabled=_b("COSMOS_ENABLED"),
+        cosmos_endpoint=_s("COSMOS_ENDPOINT").rstrip("/"),
+        cosmos_key=_s("COSMOS_KEY"),
+        cosmos_database=_s("COSMOS_DATABASE", "senderra-idp"),
+        cosmos_container=_s("COSMOS_CONTAINER", "documents"),
     )

@@ -219,6 +219,14 @@ def _classification(row: pd.Series, store: DocumentStore) -> None:
     cols[3].metric("Classification score", fmt.confidence(row.get("classify_score")))
 
     evidence = row.get("classify_evidence")
+    if not (isinstance(evidence, str) and evidence):
+        # Absent when the table was built from the Cosmos projection, which
+        # strips this field because it is up to 500 characters of document prose
+        # — PHI, and it must not reach a store that feeds a dashboard. The blob
+        # record still has it, and this screen is already reading one document.
+        evidence = (store.raw_records(row["run_id"], row["doc_id"])
+                    .get("extract", {}).get("classify_evidence"))
+
     st.write("**The model's reasoning**")
     st.info(evidence if isinstance(evidence, str) and evidence else
             "No evidence recorded.")
