@@ -1,7 +1,6 @@
 """Senderra IDP demo — entry point.
 
     streamlit run app.py
-
 STREAMLIT'S EXECUTION MODEL, AND THE ONE THING TO KNOW ABOUT IT
 --------------------------------------------------------------
 Streamlit re-runs this entire file top to bottom on every interaction — every
