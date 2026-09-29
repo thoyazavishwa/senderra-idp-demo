@@ -145,12 +145,44 @@ def _fields(row: pd.Series, store: DocumentStore) -> None:
         return
 
     rows = aggregate.field_rows(result)
+    # Completeness and criticality are newer backend fields. Keep the existing
+    # scoring/evidence flattening intact, and enrich its display rows locally.
+    field_data = result.get("fields") or {}
+    for index, field_row in rows.iterrows():
+        payload = field_data.get(field_row["Field"])
+        if not isinstance(payload, dict):
+            continue
+        completeness = payload.get("completeness")
+        completeness = completeness if isinstance(completeness, dict) else {}
+        missing = completeness.get("missing") is True
+        if missing:
+            rows.at[index, "Value"] = "Missing"
+        reasons = payload.get("review_reasons")
+        if not isinstance(reasons, (list, tuple)):
+            reasons = []
+        if missing and (payload.get("criticality") == "critical"
+                        or "missing_patient_information" in reasons):
+            rows.at[index, "Why"] = "Missing patient information"
+        rows.at[index, "Criticality"] = payload.get("criticality")
+        rows.at[index, "Completeness"] = (
+            "Missing" if missing else completeness.get("status"))
     if rows.empty:
         st.info("The classifier returned `other`, so no field schema applied and "
                 "no extraction was attempted. That is a designed outcome, not a "
                 "failure — the eleventh type exists so the model is never forced "
                 "to pick a wrong one from ten that do not fit.")
         return
+
+    # Surface a backend decision/route when present. The UI only reports it;
+    # routing remains owned by the pipeline.
+    decision = result.get("decision") or result.get("route")
+    if decision is None:
+        decision = result.get("review_decision")
+    if decision is not None:
+        st.caption(f"Backend decision: {decision}")
+    backend_reasons = result.get("review_reasons")
+    if isinstance(backend_reasons, (list, tuple)) and backend_reasons:
+        st.caption("Backend review reason: " + " · ".join(map(str, backend_reasons)))
 
     only_review = st.checkbox(
         "Only fields needing review", key=f"rev_{row['doc_key']}",
@@ -188,6 +220,8 @@ def _fields(row: pd.Series, store: DocumentStore) -> None:
                                 "code a review queue would route on."),
             "Review": st.column_config.CheckboxColumn("Review"),
             "Why": st.column_config.TextColumn("Why", width="medium"),
+            "Criticality": st.column_config.TextColumn("Criticality"),
+            "Completeness": st.column_config.TextColumn("Completeness"),
             "Page": st.column_config.NumberColumn("Page", format="%d"),
             "Class": st.column_config.TextColumn(
                 "Class", help="A transcription · B registry lookup · "
